@@ -117,7 +117,10 @@ def shard(
   mesh = pxla.thread_resources.env.physical_mesh
   if mesh.empty or jax.devices()[0].platform == 'cpu':
     return jnp.asarray(x)
-  sharding = shd.NamedSharding(mesh, shd.PartitionSpec(*s))
+  filtered_spec = tuple(
+      axis if axis in mesh.axis_names else None for axis in s
+  )
+  sharding = shd.NamedSharding(mesh, shd.PartitionSpec(*filtered_spec))
   if eager:
     return place_array_on_target(x, sharding)
   return jax.lax.with_sharding_constraint(x, sharding)
