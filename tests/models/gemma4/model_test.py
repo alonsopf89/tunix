@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 from unittest import mock
 
 from absl.testing import absltest
@@ -32,6 +33,7 @@ from tunix.models import cache_utils
 from tunix.models import paged_attention
 from tunix.models.gemma4 import attention as attention_lib
 from tunix.models.gemma4 import model as model_lib
+from tunix.rl import common
 
 
 class ModelTest(parameterized.TestCase):
@@ -1274,6 +1276,189 @@ class ModelTest(parameterized.TestCase):
       passed_positions = mock_layer.call_args.args[1]
       expected_positions = jnp.arange(8, 12, dtype=jnp.int32)[None, :]
       np.testing.assert_array_equal(passed_positions, expected_positions)
+
+
+_MOE_SHAPE = (2, 8, 2, 2)  # (batch, seq, layers, top_k)
+
+
+def _tiny_moe_model(**overrides) -> model_lib.Gemma4:
+  cfg = dataclasses.replace(
+      model_lib.ModelConfig.gemma4_26b_a4b(),
+      num_layers=2,
+      num_embed=128,
+      embed_dim=64,
+      hidden_dim=128,
+      num_heads=2,
+      head_dim=32,
+      num_kv_heads=1,
+      num_global_kv_heads=1,
+      global_key_size=32,
+      sliding_window_size=4,
+      num_experts=4,
+      num_experts_per_tok=2,
+      expert_dim=32,
+      use_flash_attention=False,
+      attention_pattern=(
+          model_lib.AttentionType.LOCAL_SLIDING,
+          model_lib.AttentionType.GLOBAL,
+      ),
+      **overrides,
+  )
+  model = model_lib.Gemma4(cfg, rngs=nnx.Rngs(0))
+  leaves, treedef = jax.tree.flatten(nnx.state(model, nnx.Param))
+  keys = jax.random.split(jax.random.PRNGKey(1), len(leaves))
+  rand = [
+      0.1 * jax.random.normal(k, x.shape, x.dtype)
+      for k, x in zip(keys, leaves)
+  ]
+  nnx.update(model, jax.tree.unflatten(treedef, rand))
+  return model
+
+
+class RouterReplayTest(parameterized.TestCase):
+
+  def _inputs(self):
+    b, s = _MOE_SHAPE[:2]
+    tokens = jax.random.randint(jax.random.PRNGKey(2), (b, s), 0, 128)
+    positions = jnp.broadcast_to(jnp.arange(s)[None, :], (b, s))
+    mask = jnp.tril(jnp.ones((s, s), dtype=jnp.bool_))[None]
+    return tokens, positions, mask
+
+  def test_replay_remat_and_freeze_router(self):
+    model = _tiny_moe_model()
+    tokens, positions, mask = self._inputs()
+    route_01 = jnp.broadcast_to(jnp.array([0, 1], jnp.int32), _MOE_SHAPE)
+    route_23 = jnp.broadcast_to(jnp.array([2, 3], jnp.int32), _MOE_SHAPE)
+
+    base, _ = model(tokens, positions=positions, attention_mask=mask)
+    unset, _ = model(
+        tokens,
+        positions=positions,
+        attention_mask=mask,
+        forced_routed_experts=jnp.full(_MOE_SHAPE, -1, jnp.int32),
+    )
+    np.testing.assert_allclose(unset, base, rtol=1e-5, atol=1e-5)
+
+    out_01, _ = model(
+        tokens,
+        positions=positions,
+        attention_mask=mask,
+        forced_routed_experts=route_01,
+    )
+    out_23, _ = model(
+        tokens,
+        positions=positions,
+        attention_mask=mask,
+        forced_routed_experts=route_23,
+    )
+    self.assertFalse(np.allclose(out_01, out_23))
+
+    for remat in (model_lib.RematConfig.BLOCK, model_lib.RematConfig.DECODER):
+      remat_out, _ = nnx.jit(
+          lambda m: m(
+              tokens,
+              positions=positions,
+              attention_mask=mask,
+              forced_routed_experts=route_23,
+          )
+      )(_tiny_moe_model(remat_config=remat))
+      np.testing.assert_allclose(remat_out, out_23, rtol=1e-4, atol=1e-4)
+
+    grads = nnx.grad(
+        lambda m: jnp.sum(
+            m(
+                tokens,
+                positions=positions,
+                attention_mask=mask,
+                forced_routed_experts=route_23,
+            )[0]
+        )
+    )(_tiny_moe_model(freeze_router=True))
+    for i in range(2):
+      np.testing.assert_array_equal(grads.layers[i].moe.router_logits.value, 0)
+      np.testing.assert_array_equal(grads.layers[i].moe.router_scale.value, 0)
+      self.assertTrue(np.any(grads.layers[i].moe.gating_einsum.value != 0))
+
+  def test_invalid_forced_routed_experts(self):
+    model = _tiny_moe_model()
+    tokens, positions, mask = self._inputs()
+    zeros = jnp.zeros(_MOE_SHAPE, jnp.int32)
+
+    with self.assertRaisesRegex(ValueError, 'num_layers'):
+      model(
+          tokens,
+          positions=positions,
+          attention_mask=mask,
+          forced_routed_experts=zeros[..., 0],
+      )
+    for bad_dtype in (jnp.float32, jnp.uint8):
+      with self.assertRaisesRegex(TypeError, 'signed integer'):
+        model(
+            tokens,
+            positions=positions,
+            attention_mask=mask,
+            forced_routed_experts=zeros.astype(bad_dtype),
+        )
+    with self.assertRaisesRegex(ValueError, 'metadata'):
+      model(
+          tokens[0],
+          positions=positions[0],
+          cache={},
+          metadata=paged_attention.PagedAttnMetadata(
+              page_indices={},
+              kv_lens=np.zeros((1,), np.int32),
+              query_lens=np.zeros((1,), np.int32),
+              distribution=np.zeros((3,), np.int32),
+          ),
+          mesh=jax.sharding.Mesh(np.array(jax.devices()[:1]), ('tp',)),
+          forced_routed_experts=zeros,
+      )
+    dense_cfg = dataclasses.replace(
+        model_lib.ModelConfig.gemma4_12b(),
+        num_layers=2,
+        num_embed=128,
+        embed_dim=64,
+        hidden_dim=128,
+        num_heads=2,
+        head_dim=32,
+        num_kv_heads=1,
+    )
+    with self.assertRaisesRegex(ValueError, 'enable_moe'):
+      model_lib.Gemma4(dense_cfg, rngs=nnx.Rngs(0))(
+          tokens,
+          positions=positions,
+          attention_mask=mask,
+          forced_routed_experts=zeros,
+      )
+
+  def test_compute_per_token_logps_replays_routing(self):
+    model = _tiny_moe_model()
+    graphdef, state = nnx.split(model)
+    prompt = jnp.array([[0, 5, 6, 7], [8, 9, 10, 11]], dtype=jnp.int32)
+    completion = jnp.array([[12, 13, 1, 0], [14, 15, 16, 17]], jnp.int32)
+    pad = (jnp.concatenate([prompt, completion], axis=1) == 0)[:, :, None, None]
+
+    def logps(routed):
+      return common.compute_per_token_logps(
+          graphdef,
+          state,
+          prompt_tokens=prompt,
+          completion_tokens=completion,
+          pad_id=0,
+          eos_id=1,
+          routed_experts=routed,
+      )
+
+    r01 = jnp.where(
+        pad, -1, jnp.broadcast_to(jnp.array([0, 1], jnp.int16), _MOE_SHAPE)
+    )
+    r23 = jnp.where(
+        pad, -1, jnp.broadcast_to(jnp.array([2, 3], jnp.int16), _MOE_SHAPE)
+    )
+    self.assertFalse(np.allclose(logps(r01), logps(r23)))
+    np.testing.assert_allclose(
+        logps((r23 + 1).astype(jnp.uint8)), logps(r23), rtol=1e-6, atol=1e-6
+    )
 
 
 if __name__ == '__main__':
