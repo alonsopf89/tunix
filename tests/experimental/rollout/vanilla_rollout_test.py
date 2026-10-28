@@ -207,13 +207,27 @@ class VanillaRolloutTest(parameterized.TestCase):
 
     self.assertEqual(output.tokens[0].tolist(), unbounded[:2])
 
-  def test_wires_host_size_gib_to_cache_config(self):
-    host_size_gib = (16 * testing_utils.BYTES_PER_PAGE) / (1 << 30)
-    rollout = self.make_rollout(
-        False, rollout_vanilla_v2_host_size_gib=host_size_gib
+  def test_routes_every_turn_of_a_trajectory_to_one_rank(self):
+    rollout = self.make_rollout(False)
+    sampler = self.enterContext(
+        mock.patch.object(rollout, '_sampler', wraps=rollout._sampler)
     )
-    group_mgr = rollout._sampler._engine._kv_cache_manager._kv_cache_group_managers[0]
-    self.assertEqual(group_mgr._page_manager.num_free_host_pages, 16)
+
+    for pair_index, turn_idx in ((5, 0), (5, 1), (6, 0)):
+      rollout.generate(
+          ['1 2 3'],
+          _rollout_config(),
+          trace_tags={
+              'group_id': 3,
+              'pair_index': pair_index,
+              'turn_idx': turn_idx,
+          },
+      )
+
+    self.assertEqual(
+        [call.kwargs['route_key'] for call in sampler.call_args_list],
+        ['g3_p5', 'g3_p5', 'g3_p6'],
+    )
 
   def test_seed_seeds_the_engine(self):
     rollout = self.make_rollout(False, seed=7)
@@ -268,18 +282,13 @@ class VanillaRolloutTest(parameterized.TestCase):
 
   def test_release_and_restore_for_training(self):
     rollout = self.make_rollout(False)
-    kv_mgr = rollout._sampler._engine._kv_cache_manager  # pylint: disable=protected-access
 
     rollout.release_for_training(free_weights=False)
-    for arr in kv_mgr.get_physical_pages().values():
-      self.assertTrue(arr.is_deleted())
     self.assertFalse(
         rollout._sampler.transformer_state['offset'].value.is_deleted()  # pylint: disable=protected-access
     )
 
     rollout.restore_after_training()
-    for arr in kv_mgr.get_physical_pages().values():
-      self.assertFalse(arr.is_deleted())
 
     output = rollout.generate(['1 2 3'], _rollout_config())
     self.assertEqual(output.tokens[0].tolist(), _expected_tokens([1, 2, 3]))

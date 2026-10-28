@@ -1018,10 +1018,13 @@ class RLEngine:
                   cast(Any, None),
                   rollout_config,
                   prompt_token_ids=prompt_rows[s],
+                  trace_tags=trace_tags,
               )
               if exact_input
               else self.rollout.generate(
-                  cast(list[str], prompt_rows[s]), rollout_config
+                  cast(list[str], prompt_rows[s]),
+                  rollout_config,
+                  trace_tags=trace_tags,
               )
               for s in rl_utils.chunk_slices_by_size(
                   stop=len(prompt_rows), step=micro_batch_size

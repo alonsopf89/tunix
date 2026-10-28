@@ -127,7 +127,17 @@ class VanillaRollout(base_rollout.BaseRollout):
     Returns:
       The completions, in the order the prompts were given.
     """
+    trace_tags = kwargs.pop('trace_tags', None)
     del kwargs
+    route_key = None
+    if (
+        isinstance(trace_tags, dict)
+        and 'group_id' in trace_tags
+        and 'pair_index' in trace_tags
+    ):
+      # Every turn of a trajectory runs in the same data parallel rank, where
+      # it reuses the KV cache of its earlier turns.
+      route_key = f"g{trace_tags['group_id']}_p{trace_tags['pair_index']}"
     output = self._sampler(
         input_strings=prompts,
         max_generation_steps=rollout_config.max_tokens_to_generate,
@@ -140,6 +150,7 @@ class VanillaRollout(base_rollout.BaseRollout):
         return_logprobs=rollout_config.return_logprobs,
         return_logits=rollout_config.return_logits,
         prompt_token_ids=prompt_token_ids,
+        route_key=route_key,
     )
     return base_rollout.RolloutOutput(
         text=output.text,

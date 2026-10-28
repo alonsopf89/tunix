@@ -1291,8 +1291,8 @@ class RlEngineTokenInputTest(parameterized.TestCase):
     from tunix.perf import trace  # pylint: disable=g-import-not-at-top
     from tunix.perf.experimental import tracer  # pylint: disable=g-import-not-at-top
 
-    def generate(prompts, cfg, *, prompt_token_ids=None):
-      del cfg
+    def generate(prompts, cfg, *, prompt_token_ids=None, **kwargs):
+      del cfg, kwargs
       self.assertIsNone(prompts)
       rows = prompt_token_ids
       width = 3  # the sampler pads every microbatch to max_prompt_length

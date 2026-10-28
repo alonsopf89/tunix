@@ -23,7 +23,10 @@ from absl.testing import parameterized
 import jax
 import jax.numpy as jnp
 import numpy as np
+from tunix.common import configs as common_configs
+from tunix.common import datatypes
 from tunix.experimental.generate import configs
+from tunix.experimental.generate import request as request_lib
 from tunix.experimental.generate import utils
 
 # Sharding tests need up to 4 devices.
@@ -459,5 +462,213 @@ class CacheSizingTest(parameterized.TestCase):
     self.assertEqual(size_gib, 12.0)
 
 
+class ConfigAndSamplingParamsTest(parameterized.TestCase):
+
+  def test_to_cache_config_wires_host_size_gib(self):
+    mesh = _create_mesh((1,), ("tp",))
+    rollout_config = common_configs.RolloutConfig(
+        rollout_vanilla_v2_host_size_gib=2.5
+    )
+    with mock.patch.object(
+        utils, "resolve_max_device_size_gib", return_value=8.0
+    ):
+      cache_config = utils.to_cache_config(
+          rollout_config, jnp.bfloat16, mesh
+      )
+
+    self.assertEqual(cache_config.max_device_size_gib, 8.0)
+    self.assertEqual(cache_config.max_host_size_gib, 2.5)
+    self.assertEqual(cache_config.dtype, jnp.bfloat16)
+
+  def test_to_scheduler_config_truncates_chunked_prefill_to_sliding_window(self):
+    rollout_config = common_configs.RolloutConfig(
+        rollout_vanilla_v2_chunked_prefill_length=32
+    )
+    geometries = {
+        "full": datatypes.CacheGeometry(num_kv_heads=1, head_dim=1),
+        "sliding": datatypes.CacheGeometry(
+            num_kv_heads=1, head_dim=1, window_size=12
+        ),
+    }
+
+    scheduler_config = utils.to_scheduler_config(rollout_config, geometries)
+
+    self.assertEqual(scheduler_config.max_chunked_prefill_length, 8)
+
+  def test_verify_sampling_params_top_k_over_max_top_k_raises(self):
+    rollout_config = common_configs.RolloutConfig(top_k=4)
+    utils.verify_sampling_params(
+        "fits",
+        request_lib.SamplingParams(max_tokens=8, top_k=4),
+        rollout_config,
+    )
+
+    with self.assertRaisesRegex(ValueError, "max_top_k"):
+      utils.verify_sampling_params(
+          "0",
+          request_lib.SamplingParams(max_tokens=8, top_k=5),
+          rollout_config,
+      )
+
+  def test_verify_sampling_params_any_top_k_allowed_without_max_top_k(self):
+    rollout_config = common_configs.RolloutConfig(top_k=None)
+    utils.verify_sampling_params(
+        "0",
+        request_lib.SamplingParams(max_tokens=8, top_k=1000),
+        rollout_config,
+    )
+
+  @parameterized.named_parameters(
+      ("zero_max_tokens", dict(max_tokens=0), "max_tokens"),
+      (
+          "negative_temperature",
+          dict(max_tokens=8, temperature=-0.1),
+          "temperature",
+      ),
+      ("zero_top_p", dict(max_tokens=8, top_p=0.0), "top_p"),
+      ("top_p_over_one", dict(max_tokens=8, top_p=1.5), "top_p"),
+      ("beam_size", dict(max_tokens=8, beam_size=2), "beam_size"),
+      (
+          "routed_experts",
+          dict(max_tokens=8, return_routed_experts=True),
+          "routed_experts",
+      ),
+      (
+          "routed_experts_prompt_start",
+          dict(max_tokens=8, routed_experts_prompt_start=1),
+          "routed_experts_prompt_start",
+      ),
+      ("logprobs", dict(max_tokens=8, return_logprobs=True), "return_logprobs"),
+      ("logits", dict(max_tokens=8, return_logits=True), "return_logits"),
+  )
+  def test_verify_sampling_params_unsupported_raises(
+      self, sampling_kwargs, message
+  ):
+    with self.assertRaisesRegex(ValueError, message):
+      utils.verify_sampling_params(
+          "0",
+          request_lib.SamplingParams(**sampling_kwargs),
+          common_configs.RolloutConfig(),
+      )
+
+  def test_verify_sampling_params_must_match_configured_outputs(self):
+    rollout_config = common_configs.RolloutConfig(
+        return_logprobs=True, return_logits=True
+    )
+    utils.verify_sampling_params(
+        "fits",
+        request_lib.SamplingParams(
+            max_tokens=8, return_logprobs=True, return_logits=True
+        ),
+        rollout_config,
+    )
+
+    with self.assertRaisesRegex(ValueError, "return_logprobs"):
+      utils.verify_sampling_params(
+          "0",
+          request_lib.SamplingParams(max_tokens=8, return_logits=True),
+          rollout_config,
+      )
+
+
+class StableRouteHashTest(absltest.TestCase):
+
+  def test_non_negative_ints_map_to_themselves(self):
+    self.assertEqual(utils.stable_route_hash(7), 7)
+
+  def test_other_keys_hash_their_string_deterministically(self):
+    self.assertEqual(
+        utils.stable_route_hash("g3_p1"),
+        utils.stable_route_hash("g3_p1"),
+    )
+    self.assertNotEqual(
+        utils.stable_route_hash("g3_p1"),
+        utils.stable_route_hash("g3_p2"),
+    )
+
+  def test_rejects_negative_ints(self):
+    with self.assertRaises(ValueError):
+      utils.stable_route_hash(-1)
+
+
+class DPRanksTest(parameterized.TestCase):
+
+  @parameterized.named_parameters(
+      dict(
+          testcase_name="dp_and_tp",
+          shape=(2, 2),
+          axis_names=("dp", "tp"),
+          expected_device_ids=((0, 1), (2, 3)),
+      ),
+      # A rank's devices run along "tp", wherever it is in the mesh.
+      dict(
+          testcase_name="tp_first",
+          shape=(2, 2),
+          axis_names=("tp", "dp"),
+          expected_device_ids=((0, 2), (1, 3)),
+      ),
+      # The DP axes ("dp" and "fsdp") index the ranks, in mesh order.
+      dict(
+          testcase_name="two_dp_axes",
+          shape=(2, 2),
+          axis_names=("dp", "fsdp"),
+          expected_device_ids=((0,), (1,), (2,), (3,)),
+      ),
+      dict(
+          testcase_name="tp_only",
+          shape=(4,),
+          axis_names=("tp",),
+          expected_device_ids=((0, 1, 2, 3),),
+      ),
+  )
+  def test_dp_ranks(self, shape, axis_names, expected_device_ids):
+    devices = jax.devices()
+    ranks = utils.dp_ranks(_create_mesh(shape, axis_names))
+
+    self.assertEqual(
+        tuple(tuple(r.devices.flat) for r in ranks),
+        tuple(tuple(devices[i] for i in ids) for ids in expected_device_ids),
+    )
+    for r in ranks:
+      self.assertEqual(r.axis_names, ("tp",))
+
+  def test_stitch_and_split_physical_pages_single_rank(self):
+    mesh = _create_mesh((1,), ("tp",))
+    pages = {"layer_0": jnp.zeros((2, 4, 2, 1, 8), dtype=jnp.float32)}
+    stitched = utils.stitch_physical_pages(mesh, [pages])
+    np.testing.assert_array_equal(stitched["layer_0"], pages["layer_0"])
+    (split_rank,) = utils.split_physical_pages(stitched, [pages])
+    np.testing.assert_array_equal(split_rank["layer_0"], pages["layer_0"])
+
+  def test_stitch_and_split_physical_pages_multiple_ranks(self):
+    mesh = _create_mesh((2,), ("dp",))
+    rank_pages = []
+    for r, rank_mesh in enumerate(utils.dp_ranks(mesh)):
+      sharding = jax.sharding.NamedSharding(
+          rank_mesh,
+          jax.sharding.PartitionSpec(),
+      )
+      arr = jax.device_put(
+          jnp.full((2, 4, 2, 1, 8), r + 1, dtype=jnp.float32), sharding
+      )
+      rank_pages.append({"layer_0": arr})
+
+    stitched = utils.stitch_physical_pages(mesh, rank_pages)
+    self.assertEqual(stitched["layer_0"].shape, (4, 4, 2, 1, 8))
+    np.testing.assert_array_equal(stitched["layer_0"][:2], 1.0)
+    np.testing.assert_array_equal(stitched["layer_0"][2:], 2.0)
+
+    split_ranks = utils.split_physical_pages(stitched, rank_pages)
+    self.assertLen(split_ranks, 2)
+    for r, (split_rank, orig_rank) in enumerate(
+        zip(split_ranks, rank_pages)
+    ):
+      self.assertEqual(
+          split_rank["layer_0"].shape, orig_rank["layer_0"].shape
+      )
+      self.assertEqual(
+          split_rank["layer_0"].sharding, orig_rank["layer_0"].sharding
+      )
+      np.testing.assert_array_equal(split_rank["layer_0"], r + 1)
 if __name__ == "__main__":
   absltest.main()
