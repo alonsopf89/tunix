@@ -446,7 +446,12 @@ class RolloutWorker(abstract_worker.Worker):
     if isinstance(result, int):
       self._policy_version = result
     else:
-      version = getattr(request, "policy_version", None)
+      if isinstance(request, sampler_lib.WeightSyncRequest):
+        version = request.policy_version
+      elif isinstance(request, datatypes.WeightSyncMetadata):
+        version = request.new_policy_version
+      else:
+        version = None
       if version is not None:
         self._policy_version = version
       else:
@@ -493,8 +498,18 @@ class RolloutWorker(abstract_worker.Worker):
         return dict(report, policy_version=self._policy_version)
     return dict(self._sync_round, policy_version=self._policy_version)
 
-  def _record_round(self, sync_request: Any, phase: str) -> None:
-    extra = getattr(sync_request, "extra_config", None) or {}
+  def _record_round(
+      self,
+      sync_request: Optional[
+          Union[sampler_lib.WeightSyncRequest, datatypes.WeightSyncMetadata]
+      ],
+      phase: str,
+  ) -> None:
+    extra = (
+        sync_request.extra_config
+        if isinstance(sync_request, sampler_lib.WeightSyncRequest)
+        else None
+    ) or {}
     req_id = extra.get("req_id")
     key = (req_id, extra.get("uuid", 0)) if req_id is not None else None
     current = (self._sync_round["req_id"], self._sync_round["uuid"])
