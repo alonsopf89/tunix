@@ -30,6 +30,8 @@ The data flow is designed around an asynchronous producer-consumer pattern:
 from __future__ import annotations
 
 import dataclasses
+import os
+import time
 from typing import Any, Dict, List, Sequence, Type, TypeVar
 
 from absl import logging
@@ -37,6 +39,9 @@ from flax import nnx
 import jax
 import jax.numpy as jnp
 import numpy as np
+from tunix.dist_rl.trajectory import base_store
+from tunix.dist_rl.trajectory import file_store
+from tunix.dist_rl.trajectory import trajectory as trajectory_lib
 from tunix.perf.experimental import constants as perf_constants
 from tunix.rl import algo_core  # pylint: disable=unused-import
 from tunix.rl import common
@@ -50,13 +55,15 @@ from tunix.rl.agentic.agents import model_agent
 from tunix.rl.agentic.environments import base_environment
 from tunix.rl.agentic.environments import task_environment
 from tunix.utils import compat
-from tunix.utils import trajectory_logger
 
 TrainingInputT = agentic_rl_learner.TrainingInputT
 RewardFn = agentic_rl_learner.RewardFn
 MetricFn = agentic_rl_learner.MetricFn
 
 TrainExample = agentic_rl_learner.TrainExample
+
+# Subdirectory of the metrics log dir that holds the trajectory stores.
+_TRAJECTORY_STORE_SUBDIR = "trajectories"
 
 
 @dataclasses.dataclass(kw_only=True)
@@ -205,7 +212,12 @@ class GRPOLearner(agentic_rl_learner.AgenticRLLearner[TGrpoConfig]):
         env_kwargs=env_kwargs,
     )
 
-    self._trajectory_logger = None
+    # Per-trajectory RL metrics (rewards, advantages, ...) are persisted to a
+    # TrajectoryStore. Eval uses its own store because eval group ids are
+    # derived from the current global step, the same way as train group ids,
+    # and would otherwise overwrite the train trajectories of that step.
+    self._trajectory_store: base_store.TrajectoryWriter | None = None
+    self._eval_trajectory_store: base_store.TrajectoryWriter | None = None
     metrics_logger_options = (
         self.rl_engine.cluster_config.training_config.metrics_logging_options
     )
@@ -214,11 +226,20 @@ class GRPOLearner(agentic_rl_learner.AgenticRLLearner[TGrpoConfig]):
     )
 
     if metrics_log_dir:
-      self._trajectory_logger = trajectory_logger.AsyncTrajectoryLogger(
-          metrics_log_dir
+      store_root_dir = os.path.join(metrics_log_dir, _TRAJECTORY_STORE_SUBDIR)
+      # A new run directory per learner, so a relaunch does not overwrite the
+      # trajectories of an earlier launch (group ids restart at 0).
+      run_timestamp = int(time.time())
+      self._trajectory_store = file_store.FileTrajectoryStore(
+          root_dir=store_root_dir, run_id=f"train_{run_timestamp}"
+      )
+      self._eval_trajectory_store = file_store.FileTrajectoryStore(
+          root_dir=store_root_dir, run_id=f"eval_{run_timestamp}"
       )
     else:
-      logging.warning("Metrics log dir is None, skipping trajectory logging.")
+      logging.warning(
+          "Metrics log dir is None, skipping trajectory metrics logging."
+      )
 
     self.algo_config.temperature = (
         self.rl_engine.get_rollout_config(
@@ -439,6 +460,72 @@ class GRPOLearner(agentic_rl_learner.AgenticRLLearner[TGrpoConfig]):
       example = example.replace(**updates)  # pyrefly: ignore[missing-attribute]
     return example
 
+  def _record_trajectory_metrics(
+      self,
+      trajectories: List[Any],
+      rewards: Any,
+      advantages: Any,
+      policy_versions: List[int],
+      mode: rl_engine_lib.Mode,
+      expected_step: int | None,
+  ) -> None:
+    """Writes per-trajectory RL metrics to the trajectory store of `mode`.
+
+    Train metrics are keyed by the trajectory's canonical id
+    (`TrajectoryItem.traj_id`). Every eval round derives its group ids from the
+    current global step, so ids of consecutive rounds can overlap; eval metrics
+    are therefore additionally keyed by the global step of the round. Failures
+    are logged and never interrupt training.
+
+    Args:
+      trajectories: The trajectory items of the processed group(s).
+      rewards: Per-trajectory rewards, aligned with `trajectories`.
+      advantages: Per-trajectory advantages, aligned with `trajectories`.
+      policy_versions: Per-trajectory rollout policy versions, aligned with
+        `trajectories`.
+      mode: The current mode (TRAIN or EVAL).
+      expected_step: The training step the trajectories belong to.
+    """
+    store = (
+        self._eval_trajectory_store
+        if mode == rl_engine_lib.Mode.EVAL
+        else self._trajectory_store
+    )
+    if store is None:
+      return
+    rewards = np.asarray(rewards)
+    advantages = np.asarray(advantages)
+    for i, item in enumerate(trajectories):
+      try:
+        traj_id = item.traj_id
+        if mode == rl_engine_lib.Mode.EVAL and expected_step is not None:
+          traj_id = f"{traj_id}_step{expected_step}"
+        trajectory_reward = item.traj.get("trajectory_reward")
+        metrics = trajectory_lib.TrajectoryMetrics(
+            extra={
+                "global_step": expected_step,
+                "rollout_policy_version": int(policy_versions[i]),
+                "status": item.traj.get("status"),
+                "trajectory_reward": (
+                    float(trajectory_reward)
+                    if trajectory_reward is not None
+                    else None
+                ),
+                "reward": float(rewards[i]),
+                "advantage": float(advantages[i]),
+                "env_time": item.traj.get("env_time"),
+                "reward_time": item.traj.get("reward_time"),
+                "conversation_text": item.traj.get("conversation_text"),
+            }
+        )
+        store.update_metrics(traj_id, metrics)
+      except Exception:  # pylint: disable=broad-exception-caught
+        logging.warning(
+            "Failed to record metrics for trajectory %d of the group.",
+            i,
+            exc_info=True,
+        )
+
   def _process_results(
       self,
       trajectories: List[Any],
@@ -488,10 +575,8 @@ class GRPOLearner(agentic_rl_learner.AgenticRLLearner[TGrpoConfig]):
     policy_versions_list: List[int] = []
     trajectory_rewards_list: List[float] = []
     raw_completion_lengths: List[int] = []
-    trajectories_to_log = []
 
     for item in trajectories:
-      trajectories_to_log.append(item.traj)
       conversation = item.traj.get("conversation_text") or []
       assistant_text = next(
           (
@@ -520,11 +605,6 @@ class GRPOLearner(agentic_rl_learner.AgenticRLLearner[TGrpoConfig]):
         raise ValueError("policy_versions is missing from trajectory task.")
       policy_versions_list.append(policy_versions[-1])
       trajectory_rewards_list.append(item.traj.get("trajectory_reward"))
-
-    # Log trajectory.
-    if self._trajectory_logger and trajectories_to_log:
-      for traj in trajectories_to_log:
-        self._trajectory_logger.log_item_async(traj)
 
     # Pad all prompts and completions to consistent lengths.
     rollout_config = self.rl_engine.cluster_config.rollout_config
@@ -793,6 +873,15 @@ class GRPOLearner(agentic_rl_learner.AgenticRLLearner[TGrpoConfig]):
       )
 
     logging.debug("Advantages computed: %s", advantages)
+
+    self._record_trajectory_metrics(
+        trajectories=trajectories,
+        rewards=rewards,
+        advantages=advantages,
+        policy_versions=policy_versions_list,
+        mode=mode,
+        expected_step=expected_step,
+    )
 
     policy_versions = np.array(policy_versions_list, dtype=np.int32)
 

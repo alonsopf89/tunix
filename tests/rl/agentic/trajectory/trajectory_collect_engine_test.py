@@ -2431,7 +2431,8 @@ class ExactTokenContinuityCollectTest(absltest.TestCase):
         beta=0.0,
         use_rollout_logps=True,
     )
-    learner._trajectory_logger = None
+    learner._trajectory_store = None
+    learner._eval_trajectory_store = None
     learner._full_batch_size = 0
     learner.metric_fns = []
     learner._compute_rewards = lambda **kw: np.array([0.0, 1.0])
