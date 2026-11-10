@@ -139,6 +139,8 @@ training_config: &base_training_config
     profiler_steps: 0
   data_sharding_axis: ["fsdp"]
   max_inflight_computations: 2
+  max_seq_tokens_per_device: null
+  # TODO(deprecate): use max_seq_tokens_per_device.
   max_seq_token_per_tpu: null
   max_segments_per_packed_row: null
 
@@ -180,7 +182,9 @@ rollout_config:
   return_logprobs: true
 
 ############################### Other RL Config ###############################
+trainer_engine: ""
 rollout_engine: "inprocess_vllm"
+inference_engine: ""
 vllm_config:
   model_version: ""
   # null: `rollout_engine: vllm` defers to vLLM's native default
@@ -392,6 +396,10 @@ cluster_config:
     otel: 4317
   local:
     auto_detect_pci_tpus: false
+    trainer_devices: ""
+    rollout_devices: ""
+    inference_devices: ""
+    # TODO(deprecate): use trainer_devices / rollout_devices / inference_devices.
     trainer_tpu_chips: "0,1"
     rollout_tpu_chips: "2,3"
     inference_tpu_chips: ""
@@ -481,3 +489,10 @@ cluster_config:
     rollout:
       jobset_yaml: "leaderworkerset.mcjax.ray.yaml"
       tpu_slice: "tpuv5e:4x4"
+
+execution_targets:
+  target: "jax:tpu"
+  trainer: ""
+  rollout: ""
+  inference: ""
+  placement: "disaggregated"

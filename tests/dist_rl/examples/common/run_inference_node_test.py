@@ -190,6 +190,41 @@ class RunInferenceNodeTest(absltest.TestCase):
     mock_server.stop_serving.assert_awaited_once_with(grace=5.0)
     mock_worker_service.stop.assert_called_once_with()
 
+  def test_gpu_execution_target_applies_jax_gpu_bootstrap(self):
+    (
+        context,
+        mock_tokenizer,
+        mock_mesh,
+        mock_worker_service,
+        registered_callbacks,
+        mock_server,
+    ) = self._setup_mocks()
+
+    def _register_and_clean_stop(*, metadata):
+      del metadata
+      registered_callbacks[0](False)
+
+    context.ipc.discovery.register.side_effect = _register_and_clean_stop
+    with (
+        mock.patch.dict(os.environ, {}, clear=True),
+        self._patched_runtime(
+            mock_tokenizer, mock_mesh, mock_worker_service, mock_server
+        ),
+    ):
+      run_inference_node.main(
+          [
+              "--port=20002",
+              "--worker_id=inference-gpu-0",
+              "--execution_target=jax:gpu",
+          ],
+          context=context,
+      )
+      self.assertEqual(os.environ.get("JAX_PLATFORMS"), "cuda,cpu")
+      self.assertEqual(
+          os.environ.get("XLA_PYTHON_CLIENT_PREALLOCATE"), "false"
+      )
+      context.jax.initialize.assert_called_once_with()
+
 
 if __name__ == "__main__":
   absltest.main()

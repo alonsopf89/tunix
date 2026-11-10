@@ -28,20 +28,20 @@ from typing import Any
 
 import transformers
 from tunix.common import datatypes as common_datatypes
+from tunix.dist_rl.common import execution_target
 from tunix.dist_rl.common import gcs_cache
 from tunix.dist_rl.common import otel_setup
 from tunix.dist_rl.common import timeouts
-from tunix.dist_rl.weight_sync import raiden_preload
+from tunix.dist_rl.distributed.runtime import bootstraps
 from tunix.dist_rl.weight_sync import weight_sync as weight_sync_lib
+from tunix.dist_rl.worker import remote_execution
 from tunix.dist_rl.worker import rollout_worker
+from tunix.generate import mappings as mappings_lib
+from tunix.generate import tokenizer_adapter as tokenizer_adapter_lib
 from tunix.models import automodel
 from tunix.rl.agentic.parser.chat_template_parser import parser as chat_parser_lib
 from tunix.utils import maxtext_utils
-
 import sentencepiece as spm
-
-# Import Raiden before any other libraries to ensure correct JAX compilation.
-raiden_preload.import_raiden()
 
 REPO_ROOT = os.path.abspath(
     os.path.join(os.path.dirname(__file__), "..", "..", "..", "..")
@@ -222,10 +222,6 @@ def _chat_parser_for(
 
 def _mapping_config_for(model_name: str):
   """Returns the Tunix-to-vLLM JAX mapping for a supported model family."""
-  from tunix.generate import (  # pylint: disable=g-import-not-at-top
-      mappings as mappings_lib,
-  )
-
   if _is_gemma4_model(model_name):
     from tunix.models.gemma4 import (  # pylint: disable=g-import-not-at-top
         mapping_vllm_jax,
@@ -433,13 +429,22 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
   )
 
   parser.add_argument(
+      "--target",
+      type=str,
+      default=os.getenv("ROLLOUT_TARGET", "jax:tpu"),
+      help=(
+          "Execution target '<framework>:<accelerator>[:<engine>]' for this"
+          " rollout worker (default: jax:tpu)."
+      ),
+  )
+  parser.add_argument(
       "--weight_sync_mode",
       type=weight_sync_lib.WeightSyncMode,
       default=weight_sync_lib.WeightSyncMode(
           os.getenv("WEIGHT_SYNC_MODE", "none")
       ),
       choices=list(weight_sync_lib.WeightSyncMode),
-      help="Weight sync mode (none, fallback, or raiden).",
+      help="Weight sync mode (none, raiden, in_memory, fs, or nccl).",
   )
   parser.add_argument(
       "--prefuse_moe_weights",
@@ -740,9 +745,6 @@ def _create_vanilla_worker(args, tokenizer):
   from tunix.dist_rl.rollout import (  # pylint: disable=g-import-not-at-top
       vanilla_sampler,
   )
-  from tunix.generate import (  # pylint: disable=g-import-not-at-top
-      tokenizer_adapter as tokenizer_adapter_lib,
-  )
 
   logging.info("Creating native sampler on the rollout mesh...")
   mesh = _create_rollout_mesh(args)
@@ -784,10 +786,6 @@ def _create_vanilla_worker(args, tokenizer):
 
 def _create_vllm_worker(args, tokenizer):
   """Creates an in-process vLLM sampler rollout worker instance."""
-  from tunix.generate import (  # pylint: disable=g-import-not-at-top
-      tokenizer_adapter as tokenizer_adapter_lib,
-  )
-
   if args.sampler == "vllm":
     sampler_adapter = _create_vllm_sampler(args, tokenizer)
   else:
@@ -860,6 +858,7 @@ def _maxtext_additional_config(
   """Returns the vLLM `additional_config` of a MaxText rollout, else None."""
   if not args.maxtext_model_name:
     return None
+
   # Select MaxText's `MaxTextForCausalLM` as rollout model (the architectures
   # override is applied by `_vllm_hf_overrides`).
   logging.info(
@@ -1033,21 +1032,26 @@ def main(argv: list[str], context: Any = None) -> None:
 
   gcs_cache.restore_jax_cache(params=_build_rollout_cache_params(args))
 
-  if context and args.sampler == "vanilla":
-    context.jax.initialize()
+  rollout_target = execution_target.ExecutionTarget.parse(
+      args.target, default_engine=args.sampler
+  )
+  bootstraps.get_runtime_bootstrap(rollout_target).initialize(
+      context,
+      weight_sync_mode=args.weight_sync_mode,
+      initialize_runtime=bool(context and args.sampler == "vanilla"),
+  )
   os.environ.setdefault("VLLM_ALLOW_LONG_MAX_MODEL_LEN", "1")
-  os.environ.setdefault("VLLM_TPU_RPA_VERSION", "2")
-  os.environ.setdefault("DISABLE_MOSAIC_ATTN", "1")
+  if rollout_target.accelerator == execution_target.Accelerator.TPU:
+    os.environ.setdefault("VLLM_TPU_RPA_VERSION", "2")
+    os.environ.setdefault("DISABLE_MOSAIC_ATTN", "1")
   os.environ.setdefault("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
   os.environ.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
   if args.maxtext_model_name:
     os.environ.setdefault("NEW_MODEL_DESIGN", "1")
 
-  from transformers import AutoTokenizer  # pylint: disable=g-import-not-at-top
-
   tokenizer_path = args.tokenizer_path or args.model_dir or args.model_id
   logging.info("Loading tokenizer from %s...", tokenizer_path)
-  tokenizer: Any = AutoTokenizer.from_pretrained(
+  tokenizer: Any = transformers.AutoTokenizer.from_pretrained(
       tokenizer_path, trust_remote_code=True
   )
   if tokenizer.pad_token_id is None and tokenizer.eos_token is not None:
@@ -1059,10 +1063,6 @@ def main(argv: list[str], context: Any = None) -> None:
       worker_service = _create_vanilla_worker(args, tokenizer)
     else:
       worker_service = _create_vllm_worker(args, tokenizer)
-
-    from tunix.dist_rl.worker import (  # pylint: disable=g-import-not-at-top
-        remote_execution,
-    )
 
     await remote_execution.serve_worker(
         worker_service,

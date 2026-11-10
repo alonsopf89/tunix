@@ -67,18 +67,26 @@ class LaunchersTest(launcher_testing.LauncherTestCase):
   def test_launcher_contract(self, expected: launcher_testing.Expected):
     self.assert_launcher(expected)
 
-  def test_local_positive_beta_requires_reference_inference_chips(self):
-    run = self.run_launcher(
+  def test_local_positive_beta_defaults_or_overrides_inference_devices(self):
+    default_inf = self.dry_run(
         "math_gsm8k_dist/launcher.sh", "agentic_grpo_config.beta=0.04"
     )
-    self.assertNotEqual(run.returncode, 0)
-    self.assertIn("cluster_config.local.inference_tpu_chips", run.stderr)
+    self.assertIn("Inference command:", default_inf.stdout)
+    default_local = default_inf.resolve().config["cluster_config"]["local"]
+    self.assertEqual(default_local["inference_devices"], "0,1")
+    self.assertEqual(default_local["inference_tpu_chips"], "0,1")
     with_chips = self.dry_run(
         "math_gsm8k_dist/launcher.sh",
         "agentic_grpo_config.beta=0.04",
         "cluster_config.local.inference_tpu_chips=4,5",
     )
     self.assertIn("Inference command:", with_chips.stdout)
+    self.assertEqual(
+        with_chips.resolve().config["cluster_config"]["local"][
+            "inference_devices"
+        ],
+        "4,5",
+    )
 
   def test_local(self):
     run, hp = self.assert_launcher(_LOCAL)

@@ -182,7 +182,7 @@ class LaunchScriptsTest(absltest.TestCase):
     self.assertIn("cluster_config.run_id=run_unit_test", res.stdout)
     self.assertIn("rl_training_config.max_steps=3", res.stdout)
 
-  def test_local_requires_inference_chips_when_inference_node_enabled(self):
+  def test_local_defaults_inference_devices_to_trainer_devices_when_unset(self):
     res = self._run_launch(
         [
             "--dry-run",
@@ -190,8 +190,18 @@ class LaunchScriptsTest(absltest.TestCase):
             "agentic_grpo_config.beta=0.04",
         ],
     )
-    self.assertNotEqual(res.returncode, 0)
-    self.assertIn("cluster_config.local.inference_tpu_chips", res.stderr)
+    self.assertEqual(res.returncode, 0, msg=res.stderr)
+    self.assertIn("Inference command:", res.stdout)
+    hp = resolve_config.initialize([
+        "cluster_config.target=local",
+        "agentic_grpo_config.beta=0.04",
+    ])
+    self.assertEqual(
+        hp.config["cluster_config"]["local"]["inference_devices"], "0,1"
+    )
+    self.assertEqual(
+        hp.config["cluster_config"]["local"]["inference_tpu_chips"], "0,1"
+    )
 
   def test_local_dry_run_includes_inference_node_when_chips_set(self):
     res = self._run_launch(
@@ -207,6 +217,136 @@ class LaunchScriptsTest(absltest.TestCase):
     # The reference worker registers through discovery; every node, including
     # the orchestrator, gets the same config arguments.
     self.assertNotIn("inference_addr", res.stdout)
+
+  def test_local_target_validates_device_slices_unless_colocated(
+      self,
+  ):
+    res_missing_trainer = self._run_launch([
+        "--dry-run",
+        "cluster_config.target=local",
+        "execution_targets.target=jax:gpu",
+        "agentic_grpo_config.beta=0.0",
+        "cluster_config.local.trainer_tpu_chips=",
+    ])
+    self.assertNotEqual(res_missing_trainer.returncode, 0)
+    self.assertIn(
+        "cluster_config.local.trainer_devices", res_missing_trainer.stderr
+    )
+
+    res_missing_rollout = self._run_launch([
+        "--dry-run",
+        "cluster_config.target=local",
+        "execution_targets.target=jax:gpu",
+        "agentic_grpo_config.beta=0.0",
+        "cluster_config.local.trainer_devices=0,1",
+        "cluster_config.local.rollout_tpu_chips=",
+    ])
+    self.assertNotEqual(res_missing_rollout.returncode, 0)
+    self.assertIn(
+        "cluster_config.local.rollout_devices", res_missing_rollout.stderr
+    )
+
+    # When inference_devices is unset, it defaults to trainer_devices.
+    res_default_inf = self._run_launch([
+        "--dry-run",
+        "cluster_config.target=local",
+        "execution_targets.target=jax:gpu",
+        "agentic_grpo_config.beta=0.04",
+        "cluster_config.local.trainer_devices=0,1",
+        "cluster_config.local.rollout_devices=2,3",
+    ])
+    self.assertEqual(res_default_inf.returncode, 0, msg=res_default_inf.stderr)
+    self.assertIn("Inference command:", res_default_inf.stdout)
+    default_inf_hp = resolve_config.initialize([
+        "cluster_config.target=local",
+        "execution_targets.target=jax:gpu",
+        "agentic_grpo_config.beta=0.04",
+        "cluster_config.local.trainer_devices=0,1",
+        "cluster_config.local.rollout_devices=2,3",
+    ])
+    self.assertEqual(
+        default_inf_hp.config["cluster_config"]["local"]["inference_devices"],
+        "0,1",
+    )
+
+    res_disagg_ok = self._run_launch([
+        "--dry-run",
+        "cluster_config.target=local",
+        "execution_targets.target=jax:gpu",
+        "agentic_grpo_config.beta=0.04",
+        "cluster_config.local.trainer_devices=0,1",
+        "cluster_config.local.rollout_devices=2,3",
+        "cluster_config.local.inference_devices=4,5",
+    ])
+    self.assertEqual(res_disagg_ok.returncode, 0, msg=res_disagg_ok.stderr)
+    self.assertIn("Inference command:", res_disagg_ok.stdout)
+
+    res_colocated_ok = self._run_launch([
+        "--dry-run",
+        "cluster_config.target=local",
+        "execution_targets.target=jax:gpu",
+        "execution_targets.placement=colocated",
+        "cluster_config.local.trainer_devices=0,1",
+        "agentic_grpo_config.beta=0.04",
+    ])
+    self.assertEqual(
+        res_colocated_ok.returncode, 0, msg=res_colocated_ok.stderr
+    )
+    self.assertIn("Inference command:", res_colocated_ok.stdout)
+
+    colocated_gpu_exports = resolve_config.render_bash_exports(
+        resolve_config.initialize([
+            "cluster_config.target=local",
+            "execution_targets.target=jax:gpu",
+            "execution_targets.placement=colocated",
+            "cluster_config.local.trainer_devices=0,1",
+            "agentic_grpo_config.beta=0.04",
+        ])
+    )
+    probe_gpu = subprocess.run(
+        [
+            "bash",
+            "-c",
+            colocated_gpu_exports
+            + "\nDRY_RUN=true\n"
+            + 'exit() { printf "SLICE=%s:%s:%s\\n" "$TRAINER_DEVICES"'
+            ' "$ROLLOUT_DEVICES" "$INFERENCE_DEVICES";'
+            ' builtin exit "$@"; }\n'
+            + f'source "{LAUNCH_DIR / "local.sh"}"\n',
+        ],
+        env=launcher_testing.launcher_env(),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    self.assertEqual(probe_gpu.returncode, 0, msg=probe_gpu.stderr)
+    self.assertIn("SLICE=0,1:0,1:0,1", probe_gpu.stdout)
+
+    colocated_tpu_exports = resolve_config.render_bash_exports(
+        resolve_config.initialize([
+            "cluster_config.target=local",
+            "execution_targets.placement=colocated",
+            "cluster_config.local.trainer_tpu_chips=0,1",
+            "agentic_grpo_config.beta=0.04",
+        ])
+    )
+    probe_tpu = subprocess.run(
+        [
+            "bash",
+            "-c",
+            colocated_tpu_exports
+            + "\nDRY_RUN=true\n"
+            + 'exit() { printf "TPU_INF=%s\\n" "$INFERENCE_DEVICES";'
+            ' builtin exit "$@"; }\n'
+            + f'source "{LAUNCH_DIR / "local.sh"}"\n',
+        ],
+        env=launcher_testing.launcher_env(),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    self.assertEqual(probe_tpu.returncode, 0, msg=probe_tpu.stderr)
+    self.assertIn("TPU_INF=0,1", probe_tpu.stdout)
 
   def test_local_dry_run_flag_does_not_launch(self):
     res = self._run_launch([

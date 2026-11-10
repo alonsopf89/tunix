@@ -43,7 +43,11 @@ class ResolveConfigTest(absltest.TestCase):
   def test_main_drops_program_name(self):
     with mock.patch("sys.stdout") as stdout:
       self.assertEqual(
-          resolve_config.main(["any_prog", "cluster_config.run_id=main_run"]),
+          resolve_config.main([
+              "any_prog",
+              "cluster_config.run_id=main_run",
+              "agentic_grpo_config.beta=0.0",
+          ]),
           0,
       )
     rendered = "".join(c.args[0] for c in stdout.write.call_args_list)
@@ -79,10 +83,22 @@ class ResolveConfigTest(absltest.TestCase):
     self.assertEqual(hp.config["agentic_grpo_config"]["epsilon"], 0.2)
     self.assertEqual(hp.config["weight_sync_config"]["mode"], "none")
     self.assertEqual(
+        hp.config["cluster_config"]["local"]["trainer_devices"], "0,1"
+    )
+    self.assertEqual(
+        hp.config["cluster_config"]["local"]["rollout_devices"], "2,3"
+    )
+    self.assertEqual(
+        hp.config["cluster_config"]["local"]["inference_devices"], "0,1"
+    )
+    self.assertEqual(
         hp.config["cluster_config"]["local"]["trainer_tpu_chips"], "0,1"
     )
     self.assertEqual(
         hp.config["cluster_config"]["local"]["rollout_tpu_chips"], "2,3"
+    )
+    self.assertEqual(
+        hp.config["cluster_config"]["local"]["inference_tpu_chips"], "0,1"
     )
     # Since default beta=0.04 > 0, inference node is automatically enabled.
     self.assertTrue(hp.config["cluster_config"]["run_inference_node"])
@@ -421,7 +437,7 @@ weight_sync_config:
         # Null: random weights only when Raiden's bootstrap sync replaces them.
         ("raiden", "null", True),
         ("none", "null", False),
-        ("fallback", "null", False),
+        ("in_memory", "null", False),
         # Explicit values are kept; any mode may load the checkpoint.
         ("raiden", "true", True),
         ("raiden", "false", False),
@@ -437,7 +453,7 @@ weight_sync_config:
         )
 
   def test_rollout_random_init_without_raiden_fails_loud(self):
-    for mode in ("none", "fallback"):
+    for mode in ("none", "in_memory"):
       with self.subTest(mode=mode):
         with self.assertRaisesRegex(
             ValueError,
@@ -472,7 +488,7 @@ weight_sync_config:
     ]
     for rollout_engine in ("inprocess_vllm", "vllm"):
       # vLLM's `MaxTextForCausalLM` never loads the checkpoint itself.
-      for mode in ("none", "fallback"):
+      for mode in ("none", "in_memory"):
         with self.subTest(rollout_engine=rollout_engine, mode=mode):
           with self.assertRaisesRegex(
               ValueError,
@@ -638,13 +654,13 @@ weight_sync_config:
   def test_orchestrator_choices_fail_loud(self):
     hp = resolve_config.initialize([
         "agentic_grpo_config.trajectory_group_order=prompt_arrival",
-        "weight_sync_config.mode=fallback",
+        "weight_sync_config.mode=in_memory",
     ])
     self.assertEqual(
         hp.config["agentic_grpo_config"]["trajectory_group_order"],
         "prompt_arrival",
     )
-    self.assertEqual(hp.config["weight_sync_config"]["mode"], "fallback")
+    self.assertEqual(hp.config["weight_sync_config"]["mode"], "in_memory")
     with self.assertRaisesRegex(
         ValueError, "agentic_grpo_config.trajectory_group_order must be one of"
     ):
@@ -653,6 +669,10 @@ weight_sync_config:
       )
     with self.assertRaisesRegex(
         ValueError, "weight_sync_config.mode must be one of"
+    ):
+      resolve_config.initialize(["weight_sync_config.mode=gloo"])
+    with self.assertRaisesRegex(
+        ValueError, "requires GPU accelerators on both trainer and rollout"
     ):
       resolve_config.initialize(["weight_sync_config.mode=nccl"])
     with self.assertRaisesRegex(
@@ -665,6 +685,145 @@ weight_sync_config:
       resolve_config.initialize([
           "agentic_grpo_config.max_version_span=2",
           "agentic_grpo_config.trajectory_group_order=prompt_arrival",
+      ])
+
+  def test_execution_targets_inheritance_and_cross_role_validation(self):
+    hp_gpu = resolve_config.initialize([
+        "execution_targets.target=jax:gpu",
+        "weight_sync_config.mode=nccl",
+    ])
+    self.assertEqual(
+        hp_gpu.cluster_targets.trainer.format(), "jax:gpu:peft_trainer_v2"
+    )
+    self.assertEqual(
+        hp_gpu.cluster_targets.rollout.format(), "jax:gpu:inprocess_vllm"
+    )
+    self.assertEqual(
+        hp_gpu.cluster_targets.inference.format(), "jax:gpu:tunix_inference"
+    )
+
+    hp_maxtext = resolve_config.initialize([
+        "model_config.model_source=maxtext",
+        "model_config.model_path=/ckpt/qwen3-1.7b/0/items",
+        "model_config.kwargs.maxtext_model_name=qwen3-1.7b",
+        "weight_sync_config.mode=raiden",
+    ])
+    self.assertEqual(
+        hp_maxtext.cluster_targets.trainer.format(), "jax:tpu:maxtext"
+    )
+    self.assertEqual(
+        hp_maxtext.cluster_targets.inference.format(), "jax:tpu:maxtext"
+    )
+
+    hp_custom_engines = resolve_config.initialize([
+        "trainer_engine=torchtitan",
+        "inference_engine=vllm_scoring",
+    ])
+    self.assertEqual(
+        hp_custom_engines.cluster_targets.trainer.format(),
+        "jax:tpu:torchtitan",
+    )
+    self.assertEqual(
+        hp_custom_engines.cluster_targets.inference.format(),
+        "jax:tpu:vllm_scoring",
+    )
+
+    hp_hybrid = resolve_config.initialize([
+        "execution_targets.trainer=torch:tpu:torchtitan",
+        "execution_targets.rollout=jax:gpu:vllm",
+        "execution_targets.placement=disaggregated",
+        "weight_sync_config.mode=fs",
+    ])
+    self.assertEqual(
+        hp_hybrid.cluster_targets.trainer.format(), "torch:tpu:torchtitan"
+    )
+    self.assertEqual(
+        hp_hybrid.cluster_targets.rollout.format(), "jax:gpu:vllm"
+    )
+
+    hp_in_mem_disagg = resolve_config.initialize(
+        ["weight_sync_config.mode=in_memory"]
+    )
+    self.assertEqual(
+        hp_in_mem_disagg.cluster_targets.weight_sync_mode.value, "in_memory"
+    )
+
+    for override in (
+        "cluster_config.local.rollout_tpu_chips=4,5",
+        "cluster_config.local.inference_tpu_chips=4,5",
+    ):
+      with self.subTest(override=override):
+        hp_coloc = resolve_config.initialize([
+            "execution_targets.placement=colocated",
+            override,
+        ])
+        local_coloc = hp_coloc.config["cluster_config"]["local"]
+        self.assertEqual(local_coloc["trainer_devices"], "4,5")
+        self.assertEqual(local_coloc["rollout_devices"], "4,5")
+        self.assertEqual(local_coloc["inference_devices"], "4,5")
+
+    hp_k8s_coloc = resolve_config.initialize([
+        "cluster_config.target=k8s",
+        "execution_targets.placement=colocated",
+    ])
+    self.assertEqual(
+        hp_k8s_coloc.config["cluster_config"]["local"]["rollout_devices"],
+        "2,3",
+    )
+
+    with self.assertRaisesRegex(
+        ValueError,
+        "Colocated placement requires trainer, rollout, and inference",
+    ):
+      resolve_config.initialize([
+          "execution_targets.trainer=jax:tpu",
+          "execution_targets.rollout=jax:gpu",
+          "execution_targets.placement=colocated",
+      ])
+
+    with self.assertRaisesRegex(
+        ValueError,
+        r"weight_sync_mode='raiden' currently requires TPU accelerators on both"
+        r" trainer and rollout \(GPU support for Raiden is not yet"
+        r" implemented\)",
+    ):
+      resolve_config.initialize([
+          "execution_targets.target=jax:gpu",
+          "weight_sync_config.mode=raiden",
+      ])
+
+  def test_max_seq_tokens_per_device_syncs_with_legacy_tpu_field(self):
+    hp = resolve_config.initialize([
+        "batch_size=6",
+        "rl_training_config.max_seq_tokens_per_device=4096",
+        "rl_training_config.mini_batch_size=3",
+        "rl_training_config.train_micro_batch_size=4",
+    ])
+    self.assertEqual(
+        hp.config["rl_training_config"]["max_seq_token_per_tpu"], 4096
+    )
+    self.assertEqual(
+        hp.config["rl_training_config"]["max_seq_tokens_per_device"], 4096
+    )
+
+    # Setting max_seq_tokens_per_device=0 disables packing, so MaxText
+    # micro-batch FSDP divisibility validation still fires.
+    with self.assertRaisesRegex(
+        ValueError, "must be divisible by actor_model_config.mesh fsdp"
+    ):
+      resolve_config.initialize([
+          "actor_model_config.model_source=maxtext",
+          "actor_model_config.model_path=/ckpt/qwen3-1.7b/0/items",
+          "actor_model_config.kwargs.maxtext_model_name=qwen3-1.7b",
+          "actor_model_config.mesh.shape=(2,1)",
+          "rl_training_config.max_seq_tokens_per_device=0",
+          "rl_training_config.train_micro_batch_size=1",
+      ])
+
+    with self.assertRaisesRegex(ValueError, "must match when both are set"):
+      resolve_config.initialize([
+          "rl_training_config.max_seq_tokens_per_device=4096",
+          "rl_training_config.max_seq_token_per_tpu=8192",
       ])
 
   def test_weight_sync_requires_matching_maxtext_sources(self):
@@ -682,7 +841,7 @@ weight_sync_config:
       )
     with self.assertRaisesRegex(ValueError, "got 'huggingface' and 'maxtext'"):
       resolve_config.initialize([
-          "weight_sync_config.mode=fallback",
+          "weight_sync_config.mode=in_memory",
           "rollout_model_config.model_source=maxtext",
           "rollout_model_config.kwargs.maxtext_model_name=qwen3-1.7b",
       ])

@@ -31,7 +31,9 @@ from tunix.dist_rl.launch.nodes import rollout
 from tunix.dist_rl.rollout import inprocess_vllm_sampler
 from tunix.dist_rl.rollout import vanilla_sampler
 from tunix.dist_rl.rollout import vllm_sampler
+from tunix.dist_rl.weight_sync import raiden_preload
 from tunix.dist_rl.weight_sync import weight_sync as weight_sync_lib
+from tunix.dist_rl.worker import rollout_worker
 from tunix.models import automodel
 from tunix.rl.agentic.parser.chat_template_parser import parser
 from tunix.utils import maxtext_utils
@@ -376,7 +378,7 @@ class CreateRolloutWorkerTest(absltest.TestCase):
     super().setUp()
     self.tokenizer = mock.MagicMock(bos_token="<bos>", eos_token="<eos>")
     self.mock_worker_cls = self.enter_context(
-        mock.patch.object(rollout.rollout_worker, "RolloutWorker")
+        mock.patch.object(rollout_worker, "RolloutWorker")
     )
 
   def _worker_kwargs(self) -> Mapping[str, Any]:
@@ -882,6 +884,7 @@ class RolloutMainTest(absltest.TestCase):
         "cluster_config.registry_module=my_task.registry",
     ]
     with contextlib.ExitStack() as stack:
+      stack.enter_context(mock.patch.object(raiden_preload, "import_raiden"))
       mock_import = stack.enter_context(
           mock.patch.object(rollout.importlib, "import_module")
       )
@@ -1063,6 +1066,36 @@ class RolloutMainTest(absltest.TestCase):
   def test_main_raises_without_discovery_context(self):
     with self.assertRaisesRegex(RuntimeError, "Require discovery API"):
       rollout.main([], context=None)
+
+  def test_main_skips_tpu_env_defaults_on_gpu_target(self):
+    worker_service = mock.MagicMock(trajectory_store=None)
+    with contextlib.ExitStack() as stack:
+      stack.enter_context(mock.patch.dict(os.environ, {}, clear=True))
+      stack.enter_context(mock.patch.object(rollout.importlib, "import_module"))
+      stack.enter_context(mock.patch.object(gcs_cache, "restore_jax_cache"))
+      stack.enter_context(mock.patch.object(node_utils, "load_hf_tokenizer"))
+      stack.enter_context(
+          mock.patch.object(
+              rollout, "_create_rollout_worker", return_value=worker_service
+          )
+      )
+      stack.enter_context(
+          mock.patch.object(
+              node_utils, "serve_worker", new_callable=mock.AsyncMock
+          )
+      )
+      stack.enter_context(
+          mock.patch.object(otel_setup, "setup_metrics", return_value=False)
+      )
+      rollout.main(
+          [
+              "execution_targets.target=jax:gpu",
+              "weight_sync_config.mode=nccl",
+          ],
+          context=mock.Mock(),
+      )
+      self.assertNotIn("VLLM_TPU_RPA_VERSION", os.environ)
+      self.assertNotIn("DISABLE_MOSAIC_ATTN", os.environ)
 
 
 if __name__ == "__main__":

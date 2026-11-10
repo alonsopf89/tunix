@@ -15,9 +15,11 @@
 """Tests for distributed rollout model-family configuration."""
 
 import contextlib
+import importlib
 import io
 import json
 import os
+import sys
 from unittest import mock
 
 from absl.testing import absltest
@@ -746,6 +748,60 @@ class RunRolloutNodeTest(absltest.TestCase):
       self.assertIsNone(registered_callbacks[-1])
       mock_server.stop_serving.assert_awaited_once_with(grace=5.0)
       self.assertEqual(shutdown_order, ["worker_service.stop", "sampler.stop"])
+
+  def test_main_jax_gpu_target_skips_tpu_env_vars_and_jax_init(self):
+    context = mock.Mock()
+    context.jax.initialize = mock.Mock()
+    env = dict(os.environ)
+    env.pop("VLLM_TPU_RPA_VERSION", None)
+    env.pop("DISABLE_MOSAIC_ATTN", None)
+    with (
+        mock.patch.dict(os.environ, env, clear=True),
+        mock.patch.object(
+            transformers.AutoTokenizer,
+            "from_pretrained",
+            side_effect=RuntimeError("stop after env setup"),
+        ),
+        mock.patch.object(run_rollout_node.importlib, "import_module"),
+        mock.patch.object(otel_setup, "setup_metrics"),
+        mock.patch.object(gcs_cache, "restore_jax_cache"),
+    ):
+      with self.assertRaisesRegex(RuntimeError, "stop after env setup"):
+        run_rollout_node.main(
+            [
+                "--target=jax:gpu",
+                "--sampler=vllm",
+                "--weight_sync_mode=nccl",
+                "--worker_id=rollout-gpu-0",
+            ],
+            context=context,
+        )
+      self.assertNotIn("VLLM_TPU_RPA_VERSION", os.environ)
+      self.assertNotIn("DISABLE_MOSAIC_ATTN", os.environ)
+    context.jax.initialize.assert_not_called()
+
+  def test_importing_run_rollout_node_keeps_ml_frameworks_unloaded(self):
+    forbidden = ("jax", "flax", "optax", "torch", "tpu_raiden")
+    with mock.patch.dict(sys.modules):
+      for name in list(sys.modules):
+        if (
+            name == "tunix"
+            or name.startswith("tunix.")
+            or name.endswith(".tunix")
+            or ".tunix." in name
+        ):
+          sys.modules.pop(name, None)
+        elif any(
+            name == pkg or name.startswith(f"{pkg}.") or f".{pkg}" in name
+            for pkg in forbidden
+        ):
+          sys.modules[name] = None
+      for pkg in forbidden:
+        sys.modules[pkg] = None
+      mod = importlib.import_module(
+          "tunix.dist_rl.examples.common.run_rollout_node"
+      )
+      self.assertTrue(callable(mod.main))
 
 
 if __name__ == "__main__":

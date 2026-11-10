@@ -39,22 +39,24 @@ SHUTDOWN_SIGNAL_COUNT=0
 DRAIN_START_SECONDS=0
 FORCE_KILL=0
 
-if is_true "${LOCAL_AUTO_DETECT_PCI_TPUS:-false}"; then
+if is_true "${LOCAL_AUTO_DETECT_PCI_TPUS:-false}" && [[ "${TRAINER_ACCELERATOR}" == "tpu" && "${ROLLOUT_ACCELERATOR}" == "tpu" ]]; then
   GET_SORTED_TPUS_SCRIPT="${REPO_ROOT}/scripts/get_sorted_tpu_ids.py"
   if [[ -f "$GET_SORTED_TPUS_SCRIPT" && -d /dev/vfio ]]; then
     DETECTED_TRAINER_CHIPS=$("$PYTHON_BIN" "$GET_SORTED_TPUS_SCRIPT" --count 4 2>/dev/null || true)
     DETECTED_ROLLOUT_CHIPS=$("$PYTHON_BIN" "$GET_SORTED_TPUS_SCRIPT" --count 4 --begin 4 2>/dev/null || true)
     if [[ -n "$DETECTED_TRAINER_CHIPS" && -n "$DETECTED_ROLLOUT_CHIPS" ]]; then
-      LOCAL_TRAINER_TPU_CHIPS="$DETECTED_TRAINER_CHIPS"
-      LOCAL_ROLLOUT_TPU_CHIPS="$DETECTED_ROLLOUT_CHIPS"
-      echo "Discovered PCI-sorted TPU chips: Trainer=[$LOCAL_TRAINER_TPU_CHIPS], Rollout=[$LOCAL_ROLLOUT_TPU_CHIPS]"
+      PREV_TRAINER_DEVICES="${TRAINER_DEVICES:-}"
+      TRAINER_DEVICES="$DETECTED_TRAINER_CHIPS"
+      ROLLOUT_DEVICES="$DETECTED_ROLLOUT_CHIPS"
+      if [[ "${EXECUTION_PLACEMENT}" == "colocated" ]]; then
+        ROLLOUT_DEVICES="$TRAINER_DEVICES"
+        INFERENCE_DEVICES="$TRAINER_DEVICES"
+      elif [[ -z "${INFERENCE_DEVICES:-}" || "${INFERENCE_DEVICES}" == "$PREV_TRAINER_DEVICES" ]]; then
+        INFERENCE_DEVICES="$TRAINER_DEVICES"
+      fi
+      echo "Discovered PCI-sorted TPU chips: Trainer=[$TRAINER_DEVICES], Rollout=[$ROLLOUT_DEVICES], Inference=[$INFERENCE_DEVICES]"
     fi
   fi
-fi
-
-if is_true "${RUN_INFERENCE_NODE}" && [[ -z "${LOCAL_INFERENCE_TPU_CHIPS}" ]]; then
-  echo "Error: cluster_config.run_inference_node=true requires cluster_config.local.inference_tpu_chips to avoid TPU contention." >&2
-  exit 1
 fi
 
 NODE_CONFIG_ARGS=(
@@ -407,16 +409,37 @@ mkdir -p "$LOG_ROOT" "$ARTIFACT_ROOT"
 : > "$INFERENCE_LOG"
 : > "$ORCHESTRATOR_LOG"
 
-echo "Launching trainer node on TPU chips ${LOCAL_TRAINER_TPU_CHIPS}..."
-(
-  if is_true "${LOCAL_TRAINER_PATHWAYS}"; then
+configure_local_worker_env() {
+  local role_framework="$1"
+  local role_accelerator="$2"
+  local role_devices="$3"
+  local use_pathways="$4"
+
+  if [[ "${role_accelerator}" == "gpu" ]]; then
+    unset TPU_VISIBLE_DEVICES TPU_VISIBLE_CHIPS TPU_CHIPS_PER_HOST_BOUNDS TPU_HOST_BOUNDS LIBTPU_INIT_ARGS
+    if [[ -n "${role_devices}" ]]; then
+      export CUDA_VISIBLE_DEVICES="${role_devices}"
+    fi
+    if [[ "${role_framework}" == "jax" ]]; then
+      export JAX_PLATFORMS=cuda,cpu
+    else
+      unset JAX_PLATFORMS
+    fi
+    return
+  fi
+
+  if is_true "${use_pathways}"; then
     export JAX_PLATFORMS=proxy,cpu
     export JAX_BACKEND_TARGET="${LOCAL_JAX_BACKEND_TARGET}"
     export TRAINER_PATHWAYS_LOCAL_INIT=1
     unset TPU_VISIBLE_DEVICES TPU_VISIBLE_CHIPS LIBTPU_INIT_ARGS
   else
-    export JAX_PLATFORMS=tpu,cpu
-    export TPU_VISIBLE_DEVICES="${LOCAL_TRAINER_TPU_CHIPS}"
+    if [[ "${role_framework}" == "jax" ]]; then
+      export JAX_PLATFORMS=tpu,cpu
+    else
+      unset JAX_PLATFORMS
+    fi
+    export TPU_VISIBLE_DEVICES="${role_devices}"
     export TPU_VISIBLE_CHIPS="${TPU_VISIBLE_DEVICES}"
     export TPU_CHIPS_PER_HOST_BOUNDS="${LOCAL_TPU_CHIPS_PER_HOST_BOUNDS}"
     export TPU_HOST_BOUNDS="${LOCAL_TPU_HOST_BOUNDS}"
@@ -425,6 +448,11 @@ echo "Launching trainer node on TPU chips ${LOCAL_TRAINER_TPU_CHIPS}..."
   if is_true "${LOCAL_ALLOW_MULTIPLE_LIBTPU_LOAD}"; then
     export ALLOW_MULTIPLE_LIBTPU_LOAD=1
   fi
+}
+
+echo "Launching trainer node (${TRAINER_FRAMEWORK}:${TRAINER_ACCELERATOR}) on devices ${TRAINER_DEVICES}..."
+(
+  configure_local_worker_env "${TRAINER_FRAMEWORK}" "${TRAINER_ACCELERATOR}" "${TRAINER_DEVICES}" "${LOCAL_TRAINER_PATHWAYS}"
   export PYTHONUNBUFFERED=1
   print_command "Trainer command" "${TRAINER_CMD[@]}"
   exec "${TRAINER_CMD[@]}" > "$TRAINER_LOG" 2>&1
@@ -432,17 +460,9 @@ echo "Launching trainer node on TPU chips ${LOCAL_TRAINER_TPU_CHIPS}..."
 TRAINER_PID=$!
 echo "Trainer pid=$TRAINER_PID log=$TRAINER_LOG"
 
-echo "Launching rollout node on TPU chips ${LOCAL_ROLLOUT_TPU_CHIPS}..."
+echo "Launching rollout node (${ROLLOUT_FRAMEWORK}:${ROLLOUT_ACCELERATOR}) on devices ${ROLLOUT_DEVICES}..."
 (
-  export JAX_PLATFORMS=tpu,cpu
-  export TPU_VISIBLE_DEVICES="${LOCAL_ROLLOUT_TPU_CHIPS}"
-  export TPU_VISIBLE_CHIPS="${TPU_VISIBLE_DEVICES}"
-  export TPU_CHIPS_PER_HOST_BOUNDS="${LOCAL_TPU_CHIPS_PER_HOST_BOUNDS}"
-  export TPU_HOST_BOUNDS="${LOCAL_TPU_HOST_BOUNDS}"
-  export LIBTPU_INIT_ARGS="--deepsea_chips_per_host_bounds=${LOCAL_TPU_CHIPS_PER_HOST_BOUNDS} --deepsea_host_bounds=${LOCAL_TPU_HOST_BOUNDS}"
-  if is_true "${LOCAL_ALLOW_MULTIPLE_LIBTPU_LOAD}"; then
-    export ALLOW_MULTIPLE_LIBTPU_LOAD=1
-  fi
+  configure_local_worker_env "${ROLLOUT_FRAMEWORK}" "${ROLLOUT_ACCELERATOR}" "${ROLLOUT_DEVICES}" "false"
   if [[ -n "${VLLM_ADDITIONAL_CONFIG_JSON}" ]]; then
     export VLLM_ADDITIONAL_CONFIG_JSON
   fi
@@ -461,17 +481,9 @@ ROLLOUT_PID=$!
 echo "Rollout pid=$ROLLOUT_PID log=$ROLLOUT_LOG"
 
 if is_true "${RUN_INFERENCE_NODE}"; then
-  echo "Launching reference inference node on TPU chips ${LOCAL_INFERENCE_TPU_CHIPS}..."
+  echo "Launching reference inference node (${INFERENCE_FRAMEWORK}:${INFERENCE_ACCELERATOR}) on devices ${INFERENCE_DEVICES}..."
   (
-    export JAX_PLATFORMS=tpu,cpu
-    export TPU_VISIBLE_DEVICES="${LOCAL_INFERENCE_TPU_CHIPS}"
-    export TPU_VISIBLE_CHIPS="${TPU_VISIBLE_DEVICES}"
-    export TPU_CHIPS_PER_HOST_BOUNDS="${LOCAL_TPU_CHIPS_PER_HOST_BOUNDS}"
-    export TPU_HOST_BOUNDS="${LOCAL_TPU_HOST_BOUNDS}"
-    export LIBTPU_INIT_ARGS="--deepsea_chips_per_host_bounds=${LOCAL_TPU_CHIPS_PER_HOST_BOUNDS} --deepsea_host_bounds=${LOCAL_TPU_HOST_BOUNDS}"
-    if is_true "${LOCAL_ALLOW_MULTIPLE_LIBTPU_LOAD}"; then
-      export ALLOW_MULTIPLE_LIBTPU_LOAD=1
-    fi
+    configure_local_worker_env "${INFERENCE_FRAMEWORK}" "${INFERENCE_ACCELERATOR}" "${INFERENCE_DEVICES}" "false"
     export PYTHONUNBUFFERED=1
     print_command "Inference command" "${INFERENCE_CMD[@]}"
     exec "${INFERENCE_CMD[@]}" > "$INFERENCE_LOG" 2>&1

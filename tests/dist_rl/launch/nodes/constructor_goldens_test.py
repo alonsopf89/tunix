@@ -69,6 +69,7 @@ from absl.testing import absltest
 from absl.testing import parameterized
 import grain
 import jax
+from jax import sharding as jax_sharding
 from jax.experimental import mesh_utils
 from orbax import checkpoint as ocp
 import transformers
@@ -77,6 +78,7 @@ from tunix.cli.utils import data as data_lib
 from tunix.cli.utils import model as model_utils
 from tunix.dist_rl.common import datatypes as dist_datatypes
 from tunix.dist_rl.common import gcs_cache
+from tunix.dist_rl.distributed.runtime import bootstraps
 from tunix.dist_rl.launch.common import resolve_config
 from tunix.dist_rl.launch.nodes import inference
 from tunix.dist_rl.launch.nodes import node_utils
@@ -90,6 +92,7 @@ from tunix.dist_rl.rollout import inprocess_vllm_sampler
 from tunix.dist_rl.rollout import vanilla_sampler
 from tunix.dist_rl.rollout import vllm_sampler
 from tunix.dist_rl.train import peft_trainer_v2
+from tunix.dist_rl.weight_sync import raiden_preload
 from tunix.dist_rl.weight_sync import weight_sync_coordinator
 from tunix.dist_rl.worker import inference_worker as exp_inference_worker
 from tunix.dist_rl.worker import rollout_worker
@@ -174,7 +177,7 @@ _K8S_OVERRIDES = (
     "agentic_grpo_config.max_version_span=2",
     "weight_sync_config.mode=raiden",
     "trajectory_store_config.enable=true",
-    "rl_training_config.max_seq_token_per_tpu=4096",
+    "rl_training_config.max_seq_tokens_per_device=4096",
     "actor_model_config.mesh.shape=(2,2)",
 )
 # `k8s.sh` gives each rollout replica its index; the goldens run the second.
@@ -548,7 +551,16 @@ def _run_rollout(
     recorder: _Recorder, argv: list[str], context: mock.MagicMock
 ) -> None:
   """Runs the rollout node's `main` up to serving, then initializes its sampler."""
+  # Pre-warm the lazy bootstrap plugin before recording
+  # `importlib.import_module` so rollout goldens remain invariant regardless of
+  # `--test_filter` order.
+  bootstraps.get_runtime_bootstrap(
+      resolve_config.initialize(argv).cluster_targets.rollout
+  )
   _patch_model_loading(recorder)
+  recorder.stack.enter_context(
+      mock.patch.object(raiden_preload, "import_raiden")
+  )
   recorder.patch(importlib, "import_module")
   recorder.patch(gcs_cache, "restore_jax_cache")
   vllm_sampler_module = types.SimpleNamespace(
@@ -783,7 +795,7 @@ def _capture(role: node_utils.ProcessRole, case: str) -> str:
           mock.patch.object(jax, "devices", return_value=devices)
       )
       recorder.patch(mesh_utils, "create_device_mesh")
-      recorder.patch(node_utils, "Mesh")
+      recorder.patch(jax_sharding, "Mesh")
     recorder.patch(node_utils, "serve_worker", is_async=True)
     _RUNS[role](recorder, argv, context)
     env_set = {

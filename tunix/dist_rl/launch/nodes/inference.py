@@ -27,6 +27,7 @@ import asyncio
 import logging
 import sys
 
+from tunix.dist_rl.distributed.runtime import bootstraps
 from tunix.dist_rl.distributed.runtime import context as context_lib
 from tunix.dist_rl.launch.common import resolve_config
 from tunix.dist_rl.launch.nodes import node_utils
@@ -63,7 +64,9 @@ def main(
   # a malformed port or OpenTelemetry setting fails fast.
   node_utils.setup_otel_metrics(hp, "inference", worker_id)
 
-  process_context.jax.initialize()
+  bootstraps.get_runtime_bootstrap(hp.cluster_targets.inference).initialize(
+      process_context, weight_sync_mode=hp.cluster_targets.weight_sync_mode
+  )
 
   ref = hp.config_mapping(_REFERENCE_KEY)
 

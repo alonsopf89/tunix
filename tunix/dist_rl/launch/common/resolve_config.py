@@ -43,9 +43,10 @@ from typing import Any, Final
 import omegaconf
 from tunix.cli import config as cli_config
 from tunix.common import datatypes as common_datatypes
+from tunix.dist_rl.common import datatypes as dist_rl_datatypes
+from tunix.dist_rl.common import execution_target
 from tunix.dist_rl.common import gcs_cache
 from tunix.dist_rl.distributed.deployment import yaml_generator
-from tunix.dist_rl.queue_manager import trajectory_queue_manager
 from tunix.dist_rl.weight_sync import weight_sync
 
 LAUNCH_DIR = pathlib.Path(__file__).parent
@@ -94,6 +95,32 @@ def finalize_dist_config(hp: cli_config.HyperParameters) -> None:
     hp: Loaded configuration; updated in place.
   """
   _finalize_dist_defaults(hp)
+  actor_source = str(hp.config_mapping("actor_model_config")["model_source"])
+  ref_source = str(hp.config_mapping("reference_model_config")["model_source"])
+  if not hp.config["trainer_engine"]:
+    hp.config["trainer_engine"] = (
+        "maxtext" if actor_source.lower() == "maxtext" else "peft_trainer_v2"
+    )
+  if not hp.config["inference_engine"]:
+    is_maxtext_inf = (
+        ref_source.lower() == "maxtext" or actor_source.lower() == "maxtext"
+    )
+    hp.config["inference_engine"] = (
+        "maxtext" if is_maxtext_inf else "tunix_inference"
+    )
+  cluster = _mutable_section(hp, "cluster_config")
+  local = cluster["local"]
+  if isinstance(local, MutableMapping):
+    local.update(
+        resolve_colocated_devices(
+            local,
+            colocated=(
+                cluster["target"] == "local"
+                and str(hp.config_mapping("execution_targets")["placement"])
+                == execution_target.Placement.COLOCATED.value
+            ),
+        )
+    )
   _validate_dist_invariants(hp)
 
 
@@ -105,11 +132,42 @@ class DistHyperParameters(cli_config.HyperParameters):
   in the base schema (`validate_nested`).
   """
 
+  cluster_targets: execution_target.ClusterTargets
+
   def __init__(self, overrides: Sequence[str]) -> None:
     super().__init__(
         _dist_argv(overrides), merge_replace_keys=True, validate_nested=True
     )
     finalize_dist_config(self)
+    self.cluster_targets = resolve_cluster_targets(self)
+
+
+def _sync_packed_token_budget(
+    section: MutableMapping[str, Any], section_name: str
+) -> None:
+  """Validates and syncs `max_seq_tokens_per_device` and `max_seq_token_per_tpu`."""
+  dev_val = section["max_seq_tokens_per_device"]
+  tpu_val = section["max_seq_token_per_tpu"]
+  for key, val in (
+      ("max_seq_tokens_per_device", dev_val),
+      ("max_seq_token_per_tpu", tpu_val),
+  ):
+    if val is not None and (
+        isinstance(val, bool) or not isinstance(val, int) or val < 0
+    ):
+      raise ValueError(
+          f"{section_name}.{key} must be a non-negative integer or None, got"
+          f" {val!r}."
+      )
+  if dev_val is not None and tpu_val is not None and dev_val != tpu_val:
+    raise ValueError(
+        f"{section_name}.max_seq_tokens_per_device ({dev_val}) and"
+        f" {section_name}.max_seq_token_per_tpu ({tpu_val}) must match when"
+        " both are set."
+    )
+  resolved = dev_val if dev_val is not None else tpu_val
+  section["max_seq_tokens_per_device"] = resolved
+  section["max_seq_token_per_tpu"] = resolved
 
 
 def _mutable_section(
@@ -203,7 +261,11 @@ def _finalize_dist_defaults(hp: cli_config.HyperParameters) -> None:
           artifact_root / "models" / str(role_cfg["model_name"])
       )
 
+  _sync_packed_token_budget(
+      _mutable_section(hp, "training_config"), "training_config"
+  )
   rl_train = _mutable_section(hp, "rl_training_config")
+  _sync_packed_token_budget(rl_train, "rl_training_config")
   if rl_train["mini_batch_size"] is None:
     rl_train["mini_batch_size"] = int(hp.config["batch_size"])
   if not rl_train["checkpoint_root_directory"]:
@@ -216,9 +278,9 @@ def _finalize_dist_defaults(hp: cli_config.HyperParameters) -> None:
           "rl_training_config.metrics_logging_options must be a mapping or"
           f" null, got {type(metrics).__name__}."
       )
+    # The orchestrator also logs trajectories under `<log_dir>/trajectories`
+    # unless `dist_training_config.trajectory_log_dir` is set.
     if not metrics["log_dir"]:
-      # The orchestrator also logs trajectories under `<log_dir>/trajectories`
-      # unless `dist_training_config.trajectory_log_dir` is set.
       metrics["log_dir"] = str(artifact_root / "metrics")
 
   traj_store = _mutable_section(hp, "trajectory_store_config")
@@ -505,7 +567,7 @@ def _validate_dist_invariants(hp: cli_config.HyperParameters) -> None:
           "actor_model_config.model_source='maxtext' requires"
           " actor_model_config.model_path (or model_config.model_path)."
       )
-    if rl_train["max_seq_token_per_tpu"] is None:
+    if not rl_train["max_seq_tokens_per_device"]:
       micro_batch = int(rl_train["train_micro_batch_size"])
       if micro_batch % actor_axes["fsdp"] != 0:
         raise ValueError(
@@ -545,13 +607,10 @@ def _validate_dist_invariants(hp: cli_config.HyperParameters) -> None:
       _CHAT_PARSER_TYPES,
   )
   grpo = hp.config_mapping("agentic_grpo_config")
-  # TODO(noghabi): Move `GroupOrder` into a dependency-free module (e.g. under
-  # `dist_rl/common/`) so the resolver doesn't depend on `queue_manager`, and
-  # through it on flax and the agentic types. (`weight_sync.py` has no deps.)
   _check_choice(
       "agentic_grpo_config.trajectory_group_order",
       grpo["trajectory_group_order"],
-      tuple(order.value for order in trajectory_queue_manager.GroupOrder),
+      tuple(order.value for order in dist_rl_datatypes.GroupOrder),
   )
   max_version_span = grpo["max_version_span"]
   if max_version_span is not None:
@@ -562,7 +621,7 @@ def _validate_dist_invariants(hp: cli_config.HyperParameters) -> None:
       )
     if (
         grpo["trajectory_group_order"]
-        == trajectory_queue_manager.GroupOrder.PROMPT_ARRIVAL.value
+        == dist_rl_datatypes.GroupOrder.PROMPT_ARRIVAL.value
     ):
       raise ValueError(
           "agentic_grpo_config.max_version_span is only supported with"
@@ -573,6 +632,7 @@ def _validate_dist_invariants(hp: cli_config.HyperParameters) -> None:
       hp.config_mapping("weight_sync_config")["mode"],
       tuple(mode.value for mode in weight_sync.WeightSyncMode),
   )
+  resolve_cluster_targets(hp)
   _validate_maxtext_pairing(hp)
   _validate_maxtext_model_names(hp)
   _validate_maxtext_extra_flags(hp)
@@ -609,7 +669,7 @@ def _validate_dist_invariants(hp: cli_config.HyperParameters) -> None:
   # `train_micro_batch_size` counts trajectories in the distributed trainer:
   # gradient accumulation = mini_batch_size * num_generations /
   # train_micro_batch_size (not applicable with sequence packing).
-  if not rl_train["max_seq_token_per_tpu"]:
+  if not rl_train["max_seq_tokens_per_device"]:
     trajectories = mini_batch_size * num_generations
     if trajectories % micro_batch != 0:
       raise ValueError(
@@ -618,6 +678,52 @@ def _validate_dist_invariants(hp: cli_config.HyperParameters) -> None:
           f" ({trajectories}) must be divisible by"
           f" rl_training_config.train_micro_batch_size ({micro_batch})."
       )
+
+
+def resolve_cluster_targets(
+    hp: cli_config.HyperParameters,
+) -> execution_target.ClusterTargets:
+  """Resolves and validates role-scoped `ClusterTargets` from `hp`."""
+  exec_cfg = hp.config_mapping("execution_targets")
+  base = execution_target.ExecutionTarget.parse(
+      str(exec_cfg["target"]), allow_engine=False
+  )
+  _check_choice(
+      "execution_targets.placement",
+      exec_cfg["placement"],
+      tuple(p.value for p in execution_target.Placement),
+  )
+  default_engines = {
+      "trainer": str(hp.config["trainer_engine"]),
+      "rollout": str(hp.config["rollout_engine"]),
+      "inference": str(hp.config["inference_engine"]),
+  }
+  role_targets: dict[str, execution_target.ExecutionTarget] = {}
+  for role, default_engine in default_engines.items():
+    raw_spec = exec_cfg[role]
+    if not isinstance(raw_spec, str):
+      raise ValueError(
+          f"execution_targets.{role} must be a string, got {raw_spec!r}."
+      )
+    if raw_spec:
+      role_targets[role] = execution_target.ExecutionTarget.parse(
+          raw_spec, default_engine=default_engine
+      )
+    else:
+      role_targets[role] = execution_target.ExecutionTarget(
+          framework=base.framework,
+          accelerator=base.accelerator,
+          engine=default_engine,
+      )
+  return execution_target.ClusterTargets(
+      trainer=role_targets["trainer"],
+      rollout=role_targets["rollout"],
+      inference=role_targets["inference"],
+      placement=execution_target.Placement(str(exec_cfg["placement"])),
+      weight_sync_mode=weight_sync.WeightSyncMode(
+          str(hp.config_mapping("weight_sync_config")["mode"])
+      ),
+  )
 
 
 def _validate_maxtext_pairing(hp: cli_config.HyperParameters) -> None:
@@ -660,7 +766,7 @@ def rollout_init_with_random_weights(hp: cli_config.HyperParameters) -> bool:
   True makes the `inprocess_vllm` rollout start from random weights (vLLM's
   `load_format="dummy"`) instead of loading the checkpoint. Only Raiden weight
   sync replaces them: its bootstrap sync loads the trainer's weights before
-  step 0. `fallback` moves no weights, and `none` skips the sync.
+  step 0, whereas `none` skips the sync.
 
   Args:
     hp: Loaded configuration.
@@ -1085,6 +1191,16 @@ def render_bash_exports(hp: cli_config.HyperParameters) -> str:
       else {}
   )
   trainer_backend = "maxtext" if actor["model_source"] == "maxtext" else "tunix"
+  targets = resolve_cluster_targets(hp)
+
+  local = resolve_colocated_devices(
+      local,
+      colocated=(
+          cluster["target"] == "local"
+          and targets.placement == execution_target.Placement.COLOCATED
+      ),
+  )
+
   # The rollout pods' GCS compilation-cache URI, from the config alone and never
   # the launcher's environment: `gcs_cache` reads the settings from this
   # mapping, in its usual order (`rollout_gcs_dir`, then `gcs_dir`, `bucket`).
@@ -1101,6 +1217,13 @@ def render_bash_exports(hp: cli_config.HyperParameters) -> str:
 
   exports: dict[str, object] = {
       "CLUSTER_TARGET": cluster["target"],
+      "EXECUTION_PLACEMENT": targets.placement.value,
+      "TRAINER_FRAMEWORK": targets.trainer.framework.value,
+      "TRAINER_ACCELERATOR": targets.trainer.accelerator.value,
+      "ROLLOUT_FRAMEWORK": targets.rollout.framework.value,
+      "ROLLOUT_ACCELERATOR": targets.rollout.accelerator.value,
+      "INFERENCE_FRAMEWORK": targets.inference.framework.value,
+      "INFERENCE_ACCELERATOR": targets.inference.accelerator.value,
       "ORCHESTRATOR_MAIN": cluster["orchestrator_main"],
       "TRAINER_MAIN": cluster["trainer_main"],
       "ROLLOUT_MAIN": cluster["rollout_main"],
@@ -1138,9 +1261,9 @@ def render_bash_exports(hp: cli_config.HyperParameters) -> str:
           json.dumps(vllm["kwargs"], sort_keys=True) if vllm["kwargs"] else ""
       ),
       "LOCAL_AUTO_DETECT_PCI_TPUS": local["auto_detect_pci_tpus"],
-      "LOCAL_TRAINER_TPU_CHIPS": local["trainer_tpu_chips"],
-      "LOCAL_ROLLOUT_TPU_CHIPS": local["rollout_tpu_chips"],
-      "LOCAL_INFERENCE_TPU_CHIPS": local["inference_tpu_chips"],
+      "TRAINER_DEVICES": local["trainer_devices"],
+      "ROLLOUT_DEVICES": local["rollout_devices"],
+      "INFERENCE_DEVICES": local["inference_devices"],
       "LOCAL_TPU_CHIPS_PER_HOST_BOUNDS": local["tpu_chips_per_host_bounds"],
       "LOCAL_TPU_HOST_BOUNDS": local["tpu_host_bounds"],
       "LOCAL_ALLOW_MULTIPLE_LIBTPU_LOAD": local["allow_multiple_libtpu_load"],
@@ -1208,6 +1331,64 @@ def render_bash_exports(hp: cli_config.HyperParameters) -> str:
   return "\n".join(lines) + "\n"
 
 
+_LOCAL_DEVICE_DEFAULTS: Final[tuple[tuple[str, str], ...]] = (
+    ("trainer_devices", ""),
+    ("rollout_devices", ""),
+    ("inference_devices", ""),
+    ("inference_tpu_chips", ""),
+    ("trainer_tpu_chips", "0,1"),
+    ("rollout_tpu_chips", "2,3"),
+)
+_LOCAL_DEVICE_KEYS: Final[tuple[str, ...]] = tuple(
+    k for k, _ in _LOCAL_DEVICE_DEFAULTS
+)
+
+
+def resolve_colocated_devices(
+    local: Mapping[str, Any], *, colocated: bool = True
+) -> dict[str, object]:
+  """Syncs `*_devices` with legacy `*_tpu_chips` and resolves colocated slices."""
+  res: dict[str, object] = dict.fromkeys(_LOCAL_DEVICE_KEYS, "") | dict(local)
+  if colocated:
+    candidates = [
+        res[k]
+        for k, base_val in _LOCAL_DEVICE_DEFAULTS
+        if res[k] and str(res[k]) != base_val
+    ] or [res[k] for k in _LOCAL_DEVICE_KEYS if res[k]]
+    colocated_devices = candidates[0] if candidates else ""
+    res.update(dict.fromkeys(_LOCAL_DEVICE_KEYS, colocated_devices))
+  for role in ("trainer", "rollout", "inference"):
+    dev_key, tpu_key = f"{role}_devices", f"{role}_tpu_chips"
+    # TODO(deprecate): use trainer_devices / rollout_devices / inference_devices.
+    resolved = str(res[dev_key] or res[tpu_key] or "")
+    res[dev_key] = resolved
+    res[tpu_key] = resolved
+  if not res["inference_devices"]:
+    res["inference_devices"] = res["trainer_devices"]
+  res["inference_tpu_chips"] = res["inference_devices"]
+  return res
+
+
+def validate_local_launcher_invariants(
+    hp: cli_config.HyperParameters,
+) -> None:
+  """Validates local cluster contention before launching local.sh."""
+  cluster = hp.config_mapping("cluster_config")
+  if cluster["target"] != "local":
+    return
+  targets = resolve_cluster_targets(hp)
+  if targets.placement == execution_target.Placement.COLOCATED:
+    return
+
+  local = cli_config.to_str_dict(cluster["local"])
+  for key in ("trainer_devices", "rollout_devices"):
+    if not local[key]:
+      raise ValueError(
+          f"disaggregated local runs require cluster_config.local.{key}"
+          " to avoid accelerator contention."
+      )
+
+
 def main(argv: Sequence[str] | None = None) -> int:
   """Prints the bash exports for the config given on the command line.
 
@@ -1228,6 +1409,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         f"argv must start with the program name, got {list(args)!r}."
     )
   hp = initialize(args[1:])
+  validate_local_launcher_invariants(hp)
   sys.stdout.write(render_bash_exports(hp))
   return 0
 
